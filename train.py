@@ -2,6 +2,8 @@
 # Minimal iterative / looped transformer prototype for char-level Shakespeare-like data.
 # Simplified for clarity and ease of running on a laptop/GPU.
 # Python 3.8+, PyTorch
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 import math
 import random
@@ -11,6 +13,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from datasets import load_dataset
+from transformers import PreTrainedTokenizerFast
+
+
 
 # ---------------------------
 # Data utilities (char-level)
@@ -32,16 +38,52 @@ class CharDataset(Dataset):
     def __getitem__(self, idx):
         return torch.tensor(self.seqs[idx], dtype=torch.long)
 
+class TokenDataset(Dataset):
+    def __init__(self, token_ids_list, seq_len=128):
+        # token_ids_list: 一个长的 token id 列表（int）
+        self.seq_len = seq_len
+        self.seqs = []
+        for i in range(0, len(token_ids_list) - seq_len, seq_len):
+            self.seqs.append(token_ids_list[i:i+seq_len])
+    def __len__(self):
+        return len(self.seqs)
+    def __getitem__(self, idx):
+        return torch.tensor(self.seqs[idx], dtype=torch.long)
+
 def load_shakespeare(path="shakespeare.txt", seq_len=128):
     text = Path(path).read_text(encoding="utf-8")
     ds = CharDataset(text, seq_len=seq_len)
     return ds
 
+def load_wikitext2(seq_len=128):
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file="tokenizer.json",
+                                    unk_token="<unk>", pad_token="<pad>",
+                                    bos_token="<s>", eos_token="</s>")
+    # 如果 tokenizer 没有 pad token（gpt2 没有），显式设置一个
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    # tokenise & concatenate
+    all_ids = []
+    for txt in ds["text"]:
+        if not txt or txt.strip() == "":
+            continue
+        ids = tokenizer.encode(txt, add_special_tokens=False)  # or True if you want
+        # 可选：在段落间加入 eos token
+        if tokenizer.eos_token_id is not None:
+            ids = ids + [tokenizer.eos_token_id]
+        all_ids.extend(ids)
+
+    dataset = TokenDataset(all_ids, seq_len=seq_len)
+    # 返回 dataset 以及 tokenizer 以便后续使用 vocab_size / itos
+    return dataset, tokenizer
+
 # ---------------------------
 # Model: Iterative Transformer
 # ---------------------------
 class IterativeTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=3, alpha=0.6):
+    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=3, alpha=0.4):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -159,7 +201,7 @@ def make_initial_logits(batch_tokens, mask_prob=0.15, device='cpu'):
     # apply mask: where mask == True we treat as unknown
     known_mask = ~mask
     # set known positions to strong one-hot logits
-    L_init.scatter_(-1, batch_tokens.unsqueeze(-1).to(device), 50.0)  # large positive
+    L_init.scatter_(-1, batch_tokens.unsqueeze(-1).to(device), 10.0)  # large positive
     # masked positions: set uniform (zeros logits correspond to uniform after softmax)
     L_init[~known_mask] = 0.0
     # for masked positions replace known_idx with 0 to avoid invalid indices (we won't use them)
@@ -170,7 +212,7 @@ def make_initial_logits(batch_tokens, mask_prob=0.15, device='cpu'):
 # ---------------------------
 # Simple training loop
 # ---------------------------
-def train_loop(model, dataloader, optim, device, epochs=3, T=3, mask_prob=0.15, detach_every=0):
+def train_loop(model, dataloader, optim, device, epochs=3, T=5, mask_prob=0.15, detach_every=0):
     model.train()
     for ep in range(epochs):
         total_loss = 0.0
@@ -213,17 +255,17 @@ def train_loop(model, dataloader, optim, device, epochs=3, T=3, mask_prob=0.15, 
 # ---------------------------
 def run_toy(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = load_shakespeare(args.data, seq_len=args.seq_len)
+    ds, tokenizer = load_wikitext2(seq_len=args.seq_len)
     global vocab_size_global
-    vocab_size_global = ds.vocab_size
-    print("vocab_size:", vocab_size_global)
+    vocab_size_global = len(tokenizer)
+    print(f"Loaded WikiText-2 with vocab size {vocab_size_global}, dataset size {len(ds)} sequences.")
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     model = IterativeTransformer(vocab_size_global, d_model=args.d_model,
                                  nhead=args.nhead, num_layers=args.num_layers,
                                  alpha=args.alpha).to(device)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     train_loop(model, dl, optim, device, epochs=args.epochs, T=args.T, mask_prob=args.mask_prob, detach_every=args.detach_every)
 
     # Save model
@@ -241,14 +283,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="shakespeare.txt")
     parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--alpha", type=float, default=0.6)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--alpha", type=float, default=0.4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--T", type=int, default=3, help="refinement steps per sample")
+    parser.add_argument("--T", type=int, default=5, help="refinement steps per sample")
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--detach_every", type=int, default=0, help="if >0, detach L every this many steps")
     args = parser.parse_args()
