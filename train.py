@@ -99,7 +99,7 @@ class IterativeTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
         # project transformer outputs back to token-logit space (delta logits)
-        self.out_proj = nn.Linear(d_model, vocab_size)
+        self.out_proj = nn.Linear(d_model, vocab_size, bias = False)
 
         # tie out_proj weights to token_emb weights
         self.out_proj.weight = self.token_emb.weight
@@ -249,6 +249,27 @@ def train_loop(model, dataloader, optim, device, epochs=5, T=5,
 
             # forward
             L_final, _ = model(L_init, known_mask=known_mask, T=T, detach_every=detach_every)
+
+            # ---- DEBUG: inspect scales and NaN/Inf ----
+            if i % 20 == 0:   # 每20个batch打印一次（根据需要调整）
+                with torch.no_grad():
+                    # alpha
+                    alpha_val = model.alpha if not isinstance(model.alpha, nn.Parameter) else model.alpha.detach().cpu().item()
+                    # L_init/L_final extremes
+                    Li_max = L_init.max().item()
+                    Li_min = L_init.min().item()
+                    Lf_max = L_final.max().item()
+                    Lf_min = L_final.min().item()
+                    # delta norm
+                    delta_norm = (L_final - L_init).norm().cpu().item()
+                    # print
+                    print(f"[debug] batch {i}: alpha={alpha_val:.6f} L_init_max={Li_max:.3f} L_init_min={Li_min:.3f} Lf_max={Lf_max:.3f} Lf_min={Lf_min:.3f} delta_norm={delta_norm:.3f}")
+                    # check NaN/Inf quickly
+                    if torch.isinf(L_final).any() or torch.isnan(L_final).any():
+                        print("[debug] Found NaN or Inf in L_final! Aborting this run.")
+                        raise RuntimeError("NaN/Inf in L_final")
+            # ---- end DEBUG ----
+            
             # compute loss only on masked positions (we want model to recover them)
             p_final = torch.log_softmax(L_final, dim=-1)  # log-probs
             # gather target
@@ -307,8 +328,8 @@ def run_toy(args):
         'model_state': model.state_dict(),
         'vocab': tokenizer.get_vocab(),
         'config': vars(args)
-    }, "iterative_transformer_shakespeare.pt")
-    print("Saved model to iterative_transformer_shakespeare.pt")
+    }, "iterative_bert.pt")
+    print("Saved model to iterative_bert.pt")
 
 # ---------------------------
 # CLI
