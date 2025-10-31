@@ -83,11 +83,11 @@ def load_wikitext2(seq_len=128):
 # Model: Iterative Transformer
 # ---------------------------
 class IterativeTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=3, alpha=0.4):
+    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=3, alpha=0.1):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
-        self.alpha = alpha
+        self.alpha = nn.Parameter(torch.tensor(float(alpha)))
 
         # embedding for tokens (used when mapping distribution -> expected embedding)
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -101,8 +101,14 @@ class IterativeTransformer(nn.Module):
         # project transformer outputs back to token-logit space (delta logits)
         self.out_proj = nn.Linear(d_model, vocab_size)
 
+        # tie out_proj weights to token_emb weights
+        self.out_proj.weight = self.token_emb.weight
+        '''
         # small layernorm on delta for stability
         self.delta_norm = nn.LayerNorm(vocab_size)
+        '''
+        # normalize hidden features (d_model) before out proj
+        self.h_norm = nn.LayerNorm(d_model)
 
         self.max_seq_len = max_seq_len = 1024  # 可在 __init__ 参数里加入默认值 max_seq_len=1024
         pe = torch.zeros(max_seq_len, d_model)
@@ -145,15 +151,24 @@ class IterativeTransformer(nn.Module):
             x_in = expected_e.permute(1, 0, 2)  # [N, B, d]
             h = self.transformer(x_in)  # [N, B, d]
             h = h.permute(1, 0, 2)  # [B, N, d]
+            h = self.h_norm(h)
 
             # project to delta logits
             delta = self.out_proj(h)  # [B, N, V]
+
+            '''
             # normalize delta for stability
             delta = self.delta_norm(delta)
+            '''
+            
+            if known_mask is not None:
+                delta = delta.masked_fill(known_mask.unsqueeze(-1), 0.0)
 
             # residual update
             L = L + self.alpha * delta
 
+            # the following code blocks the gradient, and has already been modified
+            '''
             # enforce known tokens as (very confident) one-hot logits
             if known_mask is not None:
                 # known_mask: bool, True where token given. We leave those logits as strong
@@ -168,7 +183,7 @@ class IterativeTransformer(nn.Module):
                     one_hot = torch.zeros_like(L)
                     one_hot.scatter_(-1, idx.unsqueeze(-1), 50.0)  # large positive
                     L = torch.where(known_mask.unsqueeze(-1), one_hot, L)
-
+            '''
             intermediates.append(L)
 
         return L, intermediates
@@ -181,7 +196,7 @@ class IterativeTransformer(nn.Module):
 # ---------------------------
 # Training utilities
 # ---------------------------
-def make_initial_logits(batch_tokens, mask_prob=0.05, device='cpu'):
+def make_initial_logits(batch_tokens, mask_prob=0.10, device='cpu', eps=1e-2):
     """
     batch_tokens: [B, N] long tensor of token indices (ground truth)
     Returns:
@@ -191,30 +206,40 @@ def make_initial_logits(batch_tokens, mask_prob=0.05, device='cpu'):
     """
     B, N = batch_tokens.shape
     V = vocab_size_global  # using global for simplicity
-    L_init = torch.zeros(B, N, V, device=device)
-    known_mask = torch.ones(B, N, dtype=torch.bool, device=device)
-    known_idx = batch_tokens.clone().to(device)
 
-    # randomly mask some positions for denoising (do not mask special treatment)
+    # 1) create small random logits everywhere (breaks symmetry for masked positions)
+    rand_logits = torch.randn(B, N, V, device=device, dtype=torch.float32) * eps
+
+    # 2) random mask: True means this position is masked (to be predicted)
     mask = torch.rand(B, N, device=device) < mask_prob
-    # ensure at least one masked per sequence (optional)
-    # apply mask: where mask == True we treat as unknown
-    known_mask = ~mask
-    # set known positions to strong one-hot logits
-    L_init.scatter_(-1, batch_tokens.unsqueeze(-1).to(device), 10.0)  # large positive
-    # masked positions: set uniform (zeros logits correspond to uniform after softmax)
-    L_init[~known_mask] = 0.0
-    # for masked positions replace known_idx with 0 to avoid invalid indices (we won't use them)
-    known_idx = batch_tokens.clone()
+    known_mask = ~mask  # True where token is given / known
+
+    # 3) start from the random logits and then override known positions with strong one-hot
+    L_init = rand_logits  # masked positions currently have small random values
+
+    # build one-hot for all positions, but we'll only keep it at known positions
+    one_hot = torch.zeros_like(L_init)
+    one_hot.scatter_(-1, batch_tokens.unsqueeze(-1).to(device), 10.0)  # large positive for true token
+
+    # use known_mask to keep one-hot only at known positions; masked positions retain rand_logits
+    L_init = torch.where(known_mask.unsqueeze(-1), one_hot, L_init)
+
+    # known_idx: copy of batch tokens but set masked positions to 0 for safety
+    known_idx = batch_tokens.clone().to(device)
     known_idx[~known_mask] = 0
+
     return L_init, known_mask, known_idx
 
 # ---------------------------
 # Simple training loop
 # ---------------------------
-def train_loop(model, dataloader, optim, device, epochs=5, T=5, mask_prob=0.05, detach_every=0):
+def train_loop(model, dataloader, optim, device, epochs=5, T=5,
+               mask_prob_start=0.10, mask_prob_end=0.25, detach_every=0):
     model.train()
     for ep in range(epochs):
+        # linear schedule from start -> end across epochs (inclusive)
+        mask_prob = mask_prob_start + (mask_prob_end - mask_prob_start) * (ep / max(1, epochs - 1))
+        print(f"Epoch {ep+1}/{epochs}  mask_prob={mask_prob:.4f}")
         total_loss = 0.0
         total_tokens = 0
         for i, batch in enumerate(dataloader,1):
@@ -272,7 +297,10 @@ def run_toy(args):
     '''
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-    train_loop(model, dl, optim, device, epochs=args.epochs, T=args.T, mask_prob=args.mask_prob, detach_every=args.detach_every)
+    train_loop(model, dl, optim, device, epochs=args.epochs, T=args.T,
+               mask_prob_start = args.mask_prob_start,
+               mask_prob_end = args.mask_prob_end,
+               detach_every=args.detach_every)
 
     # Save model
     torch.save({
@@ -293,11 +321,13 @@ if __name__ == "__main__":
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--alpha", type=float, default=0.4)
+    parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--T", type=int, default=5, help="refinement steps per sample")
-    parser.add_argument("--mask_prob", type=float, default=0.05)
+    # parser.add_argument("--mask_prob", type=float, default=0.05)
+    parser.add_argument("--mask_prob_start", type=float, default=0.10, help="mask prob at start of training")
+    parser.add_argument("--mask_prob_end", type=float, default=0.25, help="mask prob at end of training")
     parser.add_argument("--detach_every", type=int, default=0, help="if >0, detach L every this many steps")
     args = parser.parse_args()
     run_toy(args)
