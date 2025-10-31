@@ -212,7 +212,7 @@ def make_initial_logits(batch_tokens, mask_prob=0.15, device='cpu'):
 # ---------------------------
 # Simple training loop
 # ---------------------------
-def train_loop(model, dataloader, optim, device, epochs=3, T=5, mask_prob=0.15, detach_every=0):
+def train_loop(model, dataloader, optim, device, epochs=5, T=5, mask_prob=0.15, detach_every=0):
     model.train()
     for ep in range(epochs):
         total_loss = 0.0
@@ -266,6 +266,10 @@ def run_toy(args):
                                  nhead=args.nhead, num_layers=args.num_layers,
                                  alpha=args.alpha).to(device)
 
+    if hasattr(torch, 'compile'):
+            print("Compiling model with torch.compile ...")
+            model = torch.compile(model)
+
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     train_loop(model, dl, optim, device, epochs=args.epochs, T=args.T, mask_prob=args.mask_prob, detach_every=args.detach_every)
 
@@ -284,13 +288,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="shakespeare.txt")
     parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--T", type=int, default=5, help="refinement steps per sample")
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--detach_every", type=int, default=0, help="if >0, detach L every this many steps")
