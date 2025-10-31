@@ -1,0 +1,1 @@
+python train.py --batch_size 64 --d_model 256 --nhead 4 --num_layers 6 --alpha 0.2 --T 10 --mask_prob 0.15 --epochs 8 --lr 1e-4 --detach_every 5
