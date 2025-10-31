@@ -239,6 +239,7 @@ def train_loop(model, dataloader, optim, device, epochs=3, T=5, mask_prob=0.15, 
 
             optim.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
 
             if i % 20 == 0:  # 每20个batch打印一次
@@ -265,7 +266,7 @@ def run_toy(args):
                                  nhead=args.nhead, num_layers=args.num_layers,
                                  alpha=args.alpha).to(device)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     train_loop(model, dl, optim, device, epochs=args.epochs, T=args.T, mask_prob=args.mask_prob, detach_every=args.detach_every)
 
     # Save model
