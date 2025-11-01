@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, get_linear_schedule_with_warmup
 
 
 
@@ -152,7 +152,7 @@ class IterativeTransformer(nn.Module):
 
             # project to delta logits
             delta = self.out_proj(h)  # [B, N, V]
-            delta = self.softmax(delta, dim=-1)  # change into distribution space, control the scale
+            delta = nn.functional.softmax(delta, dim=-1)  # change into distribution space, control the scale
 
             '''
             # normalize delta for stability
@@ -301,7 +301,7 @@ def train_loop(model, dataloader, optim, device, epochs=5, T=5,
             # ---- end DEBUG ----
             
             # compute loss only on masked positions (we want model to recover them)
-            log_p_final = torch.log(P_final.clamp(min=1e-12), dim=-1)  # [B,N,V]
+            log_p_final = torch.log(P_final.clamp(min=1e-12))  # [B,N,V]
             # gather target
             targets = batch  # [B,N]
             # compute negative log likelihood on masked positions:
@@ -346,8 +346,9 @@ def run_toy(args):
             print("Compiling model with torch.compile ...")
             model = torch.compile(model)
     '''
-
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+    total_steps = len(dl) * args.epochs
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    scheduler = get_linear_schedule_with_warmup(optim, num_warmup_steps=total_steps//10, num_training_steps = total_steps)
     train_loop(model, dl, optim, device, epochs=args.epochs, T=args.T,
                mask_prob_start = args.mask_prob_start,
                mask_prob_end = args.mask_prob_end,

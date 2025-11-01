@@ -4,10 +4,10 @@ python train.py \
   --d_model 256 \
   --nhead 8 \
   --num_layers 4 \
-  --alpha 0.15 \
-  --lr 5e-5 \
-  --epochs 10 \
-  --T 10 \
+  --alpha 0.3 \
+  --lr 5e-4 \
+  --epochs 30 \
+  --T 6 \
   --mask_prob_start 0.08 \
   --mask_prob_end 0.25 \
-  --detach_every 3
+  --detach_every 0
