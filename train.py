@@ -83,7 +83,7 @@ def load_wikitext2(seq_len=128):
 # Model: Iterative Transformer
 # ---------------------------
 class IterativeTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=3, alpha=0.1):
+    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=3, alpha=0.3):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -119,29 +119,26 @@ class IterativeTransformer(nn.Module):
         pe = pe.unsqueeze(0)  # [1, max_seq_len, d_model]
         self.register_buffer('pos_enc', pe)  # 不参与训练，但随模型移动到 device
 
-    def forward(self, L_init, known_mask=None, T=3, detach_every=0):
+    def forward(self, P_init, known_mask=None, T=3, detach_every=0):
         """
-        L_init: [B, N, V] initial logits (float)
+        P_init: [B, N, V] initial probs(float)
         known_mask: [B, N] bool tensor, True where token is given (not masked)
         T: number of iterative refinement steps
         detach_every: if >0, detach L every `detach_every` steps (for truncated BPTT-like stability)
-        returns final_logits [B, N, V], and optionally intermediate logits list
+        returns final_probs [B, N, V], and optionally intermediate logits list
         """
-        B, N, V = L_init.shape
-        L = L_init  # working logits
+        B, N, V = P_init.shape
+        P = P_init  # working probs
 
         intermediates = []
         for t in range(T):
             # optionally detach for stability
             if detach_every and (t % detach_every == 0) and (t > 0):
-                L = L.detach()
-
-            # probs over vocab
-            p = torch.softmax(L, dim=-1)  # [B, N, V]
+                P = P.detach()
 
             # expected embedding per position: sum_v p_{v} * emb_v
             # Efficient matmul: [B, N, V] @ [V, d] -> [B, N, d]
-            expected_e = torch.matmul(p, self.token_emb.weight)  # [B, N, d]
+            expected_e = torch.matmul(P, self.token_emb.weight)  # [B, N, d]
             
             # 在将 expected_e 传入 transformer 之前加入：
             pos = self.pos_enc[:, :N, :].to(expected_e.dtype)     # [1, N, d]
@@ -155,6 +152,7 @@ class IterativeTransformer(nn.Module):
 
             # project to delta logits
             delta = self.out_proj(h)  # [B, N, V]
+            delta = self.softmax(delta, dim=-1)  # change into distribution space, control the scale
 
             '''
             # normalize delta for stability
@@ -165,7 +163,8 @@ class IterativeTransformer(nn.Module):
                 delta = delta.masked_fill(known_mask.unsqueeze(-1), 0.0)
 
             # residual update
-            L = L + self.alpha * delta
+            P = (1.0 - self.alpha) * P + self.alpha * delta
+            P = P / P.sum(dim=-1, keepdim=True)  # re-normalize to probs
 
             # the following code blocks the gradient, and has already been modified
             '''
@@ -184,9 +183,9 @@ class IterativeTransformer(nn.Module):
                     one_hot.scatter_(-1, idx.unsqueeze(-1), 50.0)  # large positive
                     L = torch.where(known_mask.unsqueeze(-1), one_hot, L)
             '''
-            intermediates.append(L)
+            intermediates.append(P)
 
-        return L, intermediates
+        return P, intermediates
 
     def set_known_index_buffer(self, known_idx):
         # convenience: remember known indices to re-enforce during forward
@@ -230,6 +229,37 @@ def make_initial_logits(batch_tokens, mask_prob=0.10, device='cpu', eps=1e-2):
 
     return L_init, known_mask, known_idx
 
+def make_initial_probs(batch_tokens, mask_prob=0.10, device='cpu'):
+    """
+    返回：
+      P_init: [B, N, V] 概率分布（known=one-hot, masked=uniform）
+      known_mask: [B, N] bool (True=known)
+      known_idx: [B, N] long (index where known, filled with 0 for masked)
+    """
+    B, N = batch_tokens.shape
+    V = vocab_size_global  # 全局变量
+
+    # 随机 mask：True 表示被 mask（需要预测）
+    mask = torch.rand(B, N, device=device) < mask_prob
+    known_mask = ~mask  # True 表示已知
+
+    # uniform for masked positions
+    uniform = torch.full((B, N, V), 1.0 / V, device=device, dtype=torch.float32)
+
+    # one-hot for known positions
+    one_hot = torch.zeros((B, N, V), device=device, dtype=torch.float32)
+    one_hot.scatter_(-1, batch_tokens.unsqueeze(-1).to(device), 1.0)
+
+    # 合成初始概率分布
+    P_init = torch.where(known_mask.unsqueeze(-1), one_hot, uniform)
+
+    # known_idx（方便外部 re-enforce）
+    known_idx = batch_tokens.clone().to(device)
+    known_idx[~known_mask] = 0
+
+    return P_init, known_mask, known_idx
+
+
 # ---------------------------
 # Simple training loop
 # ---------------------------
@@ -244,38 +274,38 @@ def train_loop(model, dataloader, optim, device, epochs=5, T=5,
         total_tokens = 0
         for i, batch in enumerate(dataloader,1):
             batch = batch.to(device)  # [B, N]
-            L_init, known_mask, known_idx = make_initial_logits(batch, mask_prob=mask_prob, device=device)
+            P_init, known_mask, known_idx = make_initial_probs(batch, mask_prob=mask_prob, device=device)
             model.set_known_index_buffer(known_idx)  # to let model re-enforce known positions each step
 
             # forward
-            L_final, _ = model(L_init, known_mask=known_mask, T=T, detach_every=detach_every)
+            P_final, _ = model(P_init, known_mask=known_mask, T=T, detach_every=detach_every)
 
             # ---- DEBUG: inspect scales and NaN/Inf ----
             if i % 20 == 0:   # 每20个batch打印一次（根据需要调整）
                 with torch.no_grad():
                     # alpha
                     alpha_val = model.alpha if not isinstance(model.alpha, nn.Parameter) else model.alpha.detach().cpu().item()
-                    # L_init/L_final extremes
-                    Li_max = L_init.max().item()
-                    Li_min = L_init.min().item()
-                    Lf_max = L_final.max().item()
-                    Lf_min = L_final.min().item()
+                    # P_init/P_final extremes
+                    Pi_max = P_init.max().item()
+                    Pi_min = P_init.min().item()
+                    Pf_max = P_final.max().item()
+                    Pf_min = P_final.min().item()
                     # delta norm
-                    delta_norm = (L_final - L_init).norm().cpu().item()
+                    delta_norm = (P_final - P_init).norm().cpu().item()
                     # print
-                    print(f"[debug] batch {i}: alpha={alpha_val:.6f} L_init_max={Li_max:.3f} L_init_min={Li_min:.3f} Lf_max={Lf_max:.3f} Lf_min={Lf_min:.3f} delta_norm={delta_norm:.3f}")
+                    print(f"[debug] batch {i}: alpha={alpha_val:.6f} P_init_max={Pi_max:.3f} P_init_min={Pi_min:.3f} Pf_max={Pf_max:.3f} Pf_min={Pf_min:.3f} delta_norm={delta_norm:.3f}")
                     # check NaN/Inf quickly
-                    if torch.isinf(L_final).any() or torch.isnan(L_final).any():
-                        print("[debug] Found NaN or Inf in L_final! Aborting this run.")
-                        raise RuntimeError("NaN/Inf in L_final")
+                    if torch.isinf(P_final).any() or torch.isnan(P_final).any():
+                        print("[debug] Found NaN or Inf in P_final! Aborting this run.")
+                        raise RuntimeError("NaN/Inf in P_final")
             # ---- end DEBUG ----
             
             # compute loss only on masked positions (we want model to recover them)
-            p_final = torch.log_softmax(L_final, dim=-1)  # log-probs
+            log_p_final = torch.log(P_final.clamp(min=1e-12), dim=-1)  # [B,N,V]
             # gather target
             targets = batch  # [B,N]
             # compute negative log likelihood on masked positions:
-            nll = -p_final.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [B,N]
+            nll = -log_p_final.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [B,N]
             loss_mask = (~known_mask).float()  # 1 where masked (we want to predict)
             # avoid all-zero masks
             if loss_mask.sum() == 0:
